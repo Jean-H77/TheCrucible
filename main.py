@@ -1,9 +1,20 @@
+import argparse
 import csv
-import cv2
+import os
+from io import StringIO
 from itertools import groupby
 from operator import itemgetter
+from PIL import Image as PILImage
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as OpenpyxlImage
+from PIL import Image as PILImage
+import os
+
+import cv2
+import numpy as np
+import pandas as pd
 import pymongo
-import argparse
+from PIL import Image
 
 mongo_client = pymongo.MongoClient("mongodb://localhost:27017/")
 database = mongo_client["Crucible"]
@@ -27,10 +38,8 @@ def args():
 def handle_args(result):
     if result.baselight is not None:
         import_baselight(result.baselight.name)
-
     if result.xytech is not None:
         import_xytech(result.xytech.name)
-
     if result.process is not None:
         process_video(result.process.name, result.output)
 
@@ -47,16 +56,38 @@ def import_baselight(file_path):
 
 def import_xytech(file_path):
     work_order_number = None
+    producer = None
+    operator = None
+    job = None
+    notes = None
     locations = []
     with open(file_path) as f:
         for line in f:
             if line.strip().startswith("Xytech Workorder"):
                 work_order_number = line.split()[2]
+                continue
+            if line.strip().startswith("Producer"):
+                producer = ' '.join(line.split()[1:])
+                continue
+            if line.strip().startswith("Operator"):
+                operator = ' '.join(line.split()[1:])
+                continue
+            if line.strip().startswith("Job"):
+                job = ' '.join(line.split()[1:])
+                continue
+            if line.strip().startswith("Notes"):
+                notes = next(f).strip()
+                continue
             if line.strip().startswith("/"):
                 locations.append(line)
-        if work_order_number is not None:
-            data = [{'work_order_number': work_order_number, 'location': location} for location in locations]
-            xytech_collection.insert_many(data)
+        data = [{
+            'work_order_number': work_order_number,
+            'Producer': producer,
+            'Operator': operator,
+            'Job': job,
+            'Notes': notes,
+            'location': locations}]
+        xytech_collection.insert_many(data)
 
 
 def process_video(file_path, output):
@@ -67,9 +98,99 @@ def process_video(file_path, output):
     print("FPS: {}".format(fps))
     if output is not False:
         result = baselight_collection.find({"frames": {"$elemMatch": {"$gte": 0, "$lte": frame_count}}}, {'_id': 0})
-        for data in result:
-            print(data)
-    print(get_time_code(fps, frame_count))
+    with open('temp_xytech.txt', 'w') as x_f:
+        xytech_data = xytech_collection.find()
+        for data in xytech_data:
+            x_f.write(f"Xytech Workorder {data['work_order_number']}\n\n")
+            x_f.write(f"Producer: {data['Producer']}\n")
+            x_f.write(f"Operator: {data['Operator']}\n")
+            x_f.write(f"Job: {data['Job']}\n\n\n")
+            x_f.write("Location:\n")
+            for location in data['location']:
+                x_f.write(location.strip() + "\n")
+            x_f.write("\nNotes:\n")
+            x_f.write(data['Notes'] + "\n\n")
+    with open('temp_baselight.txt', 'w') as b_f:
+        baselight_data = baselight_collection.find()
+        for data in baselight_data:
+            location = data['location']
+            frames = ' '.join(str(frame) for frame in data['frames'])
+            b_f.write(location + ' ' + frames + '\n')
+    export('temp_xytech.txt', 'temp_baselight.txt')
+    os.remove('temp_baselight.txt')
+    os.remove('temp_xytech.txt')
+    stop_string = 'Location,Frames to fix'
+    lines = []
+    with open('export.csv', 'r') as file:
+        for line in file:
+            if line.strip() == stop_string:
+                break
+            lines.append(line)
+    csv_data = ''.join(lines)
+    df_existing = pd.read_csv(StringIO(csv_data))
+    formatted_frames_data = []
+    for item in result:
+        frames = sorted(map(int, item['frames']))
+        location = item['location']
+        for start, end in groupby(enumerate(frames), lambda ix: ix[0] - ix[1]):
+            frame_group = list(map(str, (end for _, end in end)))
+            if len(frame_group) > 1:
+                formatted_frames_data.append(
+                    {'location': location, 'Frames to fix': f"{frame_group[0]}-{frame_group[-1]}"})
+    df = pd.DataFrame(formatted_frames_data)
+    df_combined = pd.concat([df_existing, df], ignore_index=True)
+    df_combined['Thumbnail'] = None
+    df_combined['Timecode'] = None
+    writer = pd.ExcelWriter('excel.xlsx', engine='openpyxl')
+    workbook = writer.book
+    worksheet = workbook.create_sheet('Sheet1')
+    for index, row in df_combined.iterrows():
+        frame_range = row['Frames to fix']
+        if isinstance(frame_range, float) and np.isnan(frame_range):
+            middle_frame = None
+        else:
+            if isinstance(frame_range, float):
+                middle_frame = int(frame_range)
+            else:
+                start, end = map(int, frame_range.split('-'))
+                middle_frame = (start + end) // 2
+            thumbnail = generate_thumbnail_for_frame(file_path, middle_frame)
+            if thumbnail is not None:
+                temp_image_path = f"temp_thumbnail_{index}.png"
+                thumbnail.save(temp_image_path, format="PNG")
+                img = OpenpyxlImage(temp_image_path)
+                worksheet.add_image(img, f'G{index + 2}')
+                df_combined.at[index, 'Timecode'] = get_time_code(fps, middle_frame)
+                worksheet.cell(row=index + 2, column=8, value=get_time_code(fps, middle_frame))
+    df_combined.to_excel(writer, index=False)
+    for idx, col in enumerate(df_combined):
+        series = df_combined[col]
+        max_len = max((
+            series.astype(str).map(len).max(),
+            len(str(series.name))
+        )) + 1
+        worksheet.column_dimensions[worksheet.cell(row=1, column=idx + 1).column_letter].width = max_len
+    writer._save()
+    os.remove('export.csv')
+
+
+def generate_thumbnail_for_frame(video_path, frame_number, output_size=(96, 74)):
+    clip = cv2.VideoCapture(video_path)
+    clip.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+    ret, frame = clip.read()
+    clip.release()
+    if ret:
+        thumbnail = cv2.resize(frame, output_size)
+        thumbnail = cv2.cvtColor(thumbnail, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
+        thumbnail = Image.fromarray(thumbnail)  # Convert numpy array to PIL Image
+        return thumbnail
+    else:
+        return None
+
+
+def convert_to_xls(csv_file, xls_file):
+    df = pd.read_csv(csv_file)
+    df.to_excel(xls_file, index=False)
 
 
 def get_time_code(fps, frame):
