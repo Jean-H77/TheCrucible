@@ -4,22 +4,22 @@ import os
 from io import StringIO
 from itertools import groupby
 from operator import itemgetter
-from PIL import Image as PILImage
-from openpyxl import Workbook
-from openpyxl.drawing.image import Image as OpenpyxlImage
-from PIL import Image as PILImage
-import os
 
 import cv2
 import numpy as np
 import pandas as pd
 import pymongo
 from PIL import Image
+from frameioclient import FrameioClient
+from openpyxl.drawing.image import Image as OpenpyxlImage
 
 mongo_client = pymongo.MongoClient("mongodb://localhost:27017/")
 database = mongo_client["Crucible"]
 baselight_collection = database["Baselight"]
 xytech_collection = database["Xytech"]
+
+token = os.environ['FRAMEIOTOKEN']
+frame_io_client = FrameioClient(token)
 
 
 def args():
@@ -94,8 +94,6 @@ def process_video(file_path, output):
     clip = cv2.VideoCapture(file_path)
     fps = clip.get(cv2.CAP_PROP_FPS)
     frame_count = clip.get(cv2.CAP_PROP_FRAME_COUNT)
-    print("Frame count: {}".format(frame_count))
-    print("FPS: {}".format(fps))
     if output is not False:
         result = baselight_collection.find({"frames": {"$elemMatch": {"$gte": 0, "$lte": frame_count}}}, {'_id': 0})
     with open('temp_xytech.txt', 'w') as x_f:
@@ -156,8 +154,9 @@ def process_video(file_path, output):
                 middle_frame = (start + end) // 2
             thumbnail = generate_thumbnail_for_frame(file_path, middle_frame)
             if thumbnail is not None:
-                temp_image_path = f"temp_thumbnail_{index}.png"
+                temp_image_path = f"{middle_frame}.png"
                 thumbnail.save(temp_image_path, format="PNG")
+                frame_io_client.assets.upload(destination_id="dcf4ff83-ef14-4723-9028-cbef8647506e", filepath=temp_image_path)
                 img = OpenpyxlImage(temp_image_path)
                 worksheet.add_image(img, f'G{index + 2}')
                 df_combined.at[index, 'Timecode'] = get_time_code(fps, middle_frame)
@@ -181,8 +180,8 @@ def generate_thumbnail_for_frame(video_path, frame_number, output_size=(96, 74))
     clip.release()
     if ret:
         thumbnail = cv2.resize(frame, output_size)
-        thumbnail = cv2.cvtColor(thumbnail, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
-        thumbnail = Image.fromarray(thumbnail)  # Convert numpy array to PIL Image
+        thumbnail = cv2.cvtColor(thumbnail, cv2.COLOR_BGR2RGB)
+        thumbnail = Image.fromarray(thumbnail)
         return thumbnail
     else:
         return None
